@@ -1,0 +1,1 @@
+export { default as component } from "../../../src/routes/examples/custom_dynamic_styling/+page.svelte";

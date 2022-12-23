@@ -1,0 +1,11 @@
+import type { ContentErrors, ContentParseError, ContentValidationErrors, ContextMenuColumn, ContextMenuRow, MenuButton, MenuDropDownButton, MenuLabel, MenuSeparator, MenuSpace, MenuSpaceItem } from './types.js';
+export declare function isMenuSpaceItem(item: unknown): item is MenuSpaceItem;
+export declare function isMenuSpace(item: unknown): item is MenuSpace;
+export declare function isMenuSeparator(item: unknown): item is MenuSeparator;
+export declare function isMenuLabel(item: unknown): item is MenuLabel;
+export declare function isMenuButton(item: unknown): item is MenuButton;
+export declare function isMenuDropDownButton(item: unknown): item is MenuDropDownButton;
+export declare function isContextMenuRow(item: unknown): item is ContextMenuRow;
+export declare function isContextMenuColumn(item: unknown): item is ContextMenuColumn;
+export declare function isContentParseError(contentErrors: ContentErrors): contentErrors is ContentParseError;
+export declare function isContentValidationErrors(contentErrors: ContentErrors): contentErrors is ContentValidationErrors;

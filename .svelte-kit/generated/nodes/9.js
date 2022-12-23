@@ -1,0 +1,1 @@
+export { default as component } from "../../../src/routes/examples/custom_theme_color/+page.svelte";

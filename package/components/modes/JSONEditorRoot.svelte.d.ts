@@ -1,0 +1,64 @@
+import { SvelteComponentTyped } from "svelte";
+import type { Content, ContentErrors, JSONParser, JSONPatchResult, JSONPathParser, OnBlur, OnChange, OnChangeMode, OnClassName, OnError, OnExpand, OnFocus, OnJSONEditorModal, OnRenderMenu, OnRenderValue, OnSelect, OnSortModal, OnTransformModal, TransformModalOptions, Validator } from '../../types';
+import { Mode } from '../../types';
+import type { JSONPatchDocument, JSONPath } from 'immutable-json-patch';
+declare const __propDef: {
+    props: {
+        content: Content;
+        readOnly: boolean;
+        indentation: number | string;
+        tabSize: number;
+        mode: Mode;
+        mainMenuBar: boolean;
+        navigationBar: boolean;
+        statusBar: boolean;
+        escapeControlCharacters: boolean;
+        escapeUnicodeCharacters: boolean;
+        flattenColumns: boolean;
+        parser: JSONParser;
+        parseMemoizeOne: JSONParser['parse'];
+        validator: Validator | null;
+        validationParser: JSONParser;
+        pathParser: JSONPathParser;
+        onChange: OnChange;
+        onRenderValue: OnRenderValue;
+        onClassName: OnClassName;
+        onRenderMenu: OnRenderMenu;
+        onChangeMode: OnChangeMode;
+        onError: OnError;
+        onFocus: OnFocus;
+        onBlur: OnBlur;
+        onSelect: OnSelect;
+        onSortModal: OnSortModal;
+        onTransformModal: OnTransformModal;
+        onJSONEditorModal: OnJSONEditorModal;
+        patch?: (operations: JSONPatchDocument) => JSONPatchResult;
+        expand?: (callback?: OnExpand) => void;
+        transform?: (options: TransformModalOptions) => void;
+        validate?: () => ContentErrors;
+        acceptAutoRepair?: () => Content;
+        scrollTo?: (path: JSONPath) => void;
+        findElement?: (path: JSONPath) => Element | null;
+        focus?: () => void;
+        refresh?: () => void;
+    };
+    events: {
+        [evt: string]: CustomEvent<any>;
+    };
+    slots: {};
+};
+export type JsonEditorRootProps = typeof __propDef.props;
+export type JsonEditorRootEvents = typeof __propDef.events;
+export type JsonEditorRootSlots = typeof __propDef.slots;
+export default class JsonEditorRoot extends SvelteComponentTyped<JsonEditorRootProps, JsonEditorRootEvents, JsonEditorRootSlots> {
+    get patch(): (operations: JSONPatchDocument) => JSONPatchResult;
+    get expand(): (callback?: OnExpand) => void;
+    get transform(): (options: TransformModalOptions) => void;
+    get validate(): () => ContentErrors;
+    get acceptAutoRepair(): () => Content;
+    get scrollTo(): (path: JSONPath) => void;
+    get findElement(): (path: JSONPath) => Element;
+    get focus(): () => void;
+    get refresh(): () => void;
+}
+export {};

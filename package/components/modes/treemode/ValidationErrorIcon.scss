@@ -1,0 +1,13 @@
+@import '../../../styles';
+
+// TODO: create a class shared by .expand and .validation-error buttons
+button.jse-validation-error {
+  @include jsoneditor-button;
+
+  padding: 0;
+  margin: 0;
+  vertical-align: top;
+  display: inline-flex;
+
+  color: var(--jse-warning-color);
+}

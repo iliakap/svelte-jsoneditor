@@ -1,0 +1,1 @@
+export { default as component } from "../../../src/routes/examples/switch_themes/+page.svelte";

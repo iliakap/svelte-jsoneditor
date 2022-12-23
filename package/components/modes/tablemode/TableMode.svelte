@@ -1,0 +1,1566 @@
+<svelte:options immutable={true} />
+
+<script>import { Mode, SelectionType, SortDirection, ValidationSeverity } from '../../../types';
+import TableMenu from './menu/TableMenu.svelte';
+import { compileJSONPointer, existsIn, getIn, immutableJSONPatch, isJSONArray } from 'immutable-json-patch';
+import { isTextContent, normalizeJsonParseError, parsePartialJson, repairPartialJson } from '../../../utils/jsonUtils';
+import { calculateAbsolutePosition, calculateVisibleSection, clearSortedColumnWhenAffectedByOperations, getColumns, groupValidationErrors, mergeValidationErrors, selectNextColumn, selectNextRow, selectPreviousColumn, selectPreviousRow, toTableCellPosition } from '../../../logic/table.js';
+import { isEmpty, isEqual, uniqueId } from 'lodash-es';
+import JSONValueComponent from './JSONValue.svelte';
+import { activeElementIsChildOf, createNormalizationFunctions, findParentWithNodeName, getDataPathFromTarget, getWindow } from '../../../utils/domUtils';
+import { createDebug } from '../../../utils/debug';
+import { createDocumentState, documentStatePatch, expandMinimal, expandWithCallback, getEnforceString, setEnforceString } from '../../../logic/documentState';
+import { isObjectOrArray, isUrl, stringConvert } from '../../../utils/typeUtils.js';
+import InlineValue from './tag/InlineValue.svelte';
+import { revertJSONPatchWithMoveOperations } from '../../../logic/operations';
+import { createValueSelection, getInitialSelection, isEditingSelection, isPathInsideSelection, removeEditModeFromSelection } from '../../../logic/selection';
+import { createHistory } from '../../../logic/history';
+import ColumnHeader from './ColumnHeader.svelte';
+import { sortJson } from '../../../logic/sort';
+import { encodeDataPath } from '../../../utils/domUtils.js';
+import { isValueSelection } from '../../../logic/selection.js';
+import { keyComboFromEvent } from '../../../utils/keyBindings';
+import { createFocusTracker } from '../../controls/createFocusTracker';
+import { getContext, onDestroy, onMount, tick } from 'svelte';
+import { jsonrepair } from 'jsonrepair';
+import Message from '../../controls/Message.svelte';
+import { faCheck, faCode, faWrench } from '@fortawesome/free-solid-svg-icons';
+import { measure } from '../../../utils/timeUtils';
+import memoizeOne from 'memoize-one';
+import { validateJSON } from '../../../logic/validation';
+import ValidationErrorsOverview from '../../controls/ValidationErrorsOverview.svelte';
+import { CONTEXT_MENU_HEIGHT, CONTEXT_MENU_WIDTH, SCROLL_DURATION, SIMPLE_MODAL_OPTIONS } from '../../../constants.js';
+import { noop } from '../../../utils/noop.js';
+import { createJump } from '../../../assets/jump.js/src/jump.js';
+import ValidationErrorIcon from '../treemode/ValidationErrorIcon.svelte';
+import { onCopy, onCut, onInsertCharacter, onPaste, onRemove } from '../../../logic/actions';
+import JSONRepairModal from '../../modals/JSONRepairModal.svelte';
+import { resizeObserver } from '../../../actions/resizeObserver.js';
+import TableContextMenu from '../../../components/modes/tablemode/contextmenu/TableContextMenu.svelte';
+import CopyPasteModal from '../../../components/modals/CopyPasteModal.svelte';
+import ContextMenuPointer from '../../../components/controls/contextmenu/ContextMenuPointer.svelte';
+import TableModeWelcome from './TableModeWelcome.svelte';
+import JSONPreview from '../../controls/JSONPreview.svelte';
+const debug = createDebug('jsoneditor:TableMode');
+const { open } = getContext('simple-modal');
+const { openAbsolutePopup, closeAbsolutePopup } = getContext('absolute-popup');
+const jump = createJump();
+const sortModalId = uniqueId();
+const transformModalId = uniqueId();
+const isSSR = typeof window === 'undefined';
+debug('isSSR:', isSSR);
+export let readOnly;
+export let externalContent;
+export let mainMenuBar;
+export let escapeControlCharacters;
+export let escapeUnicodeCharacters;
+export let flattenColumns;
+export let parser;
+export let parseMemoizeOne;
+export let validator;
+export let validationParser;
+export let indentation;
+export let onChange;
+export let onChangeMode;
+export let onRenderValue;
+export let onRenderMenu;
+export let onFocus;
+export let onBlur;
+export let onSelect;
+export let onSortModal;
+export let onTransformModal;
+export let onJSONEditorModal;
+let normalization;
+$: normalization = createNormalizationFunctions({
+    escapeControlCharacters,
+    escapeUnicodeCharacters
+});
+let refJsonEditor;
+let refContents;
+let refHiddenInput;
+createFocusTracker({
+    onMount,
+    onDestroy,
+    getWindow: () => getWindow(refJsonEditor),
+    hasFocus: () => (modalOpen && document.hasFocus()) || activeElementIsChildOf(refJsonEditor),
+    onFocus: () => {
+        hasFocus = true;
+        if (onFocus) {
+            onFocus();
+        }
+    },
+    onBlur: () => {
+        hasFocus = false;
+        if (onBlur) {
+            onBlur();
+        }
+    }
+});
+let json;
+let text;
+let parseError = undefined;
+let pastedJson;
+$: applyExternalContent(externalContent);
+let columns;
+$: columns = isJSONArray(json) ? getColumns(json, flattenColumns) : [];
+$: containsValidArray = json && !isEmpty(columns);
+// modalOpen is true when one of the modals is open.
+// This is used to track whether the editor still has focus
+let modalOpen = false;
+let hasFocus = false;
+let itemHeightsCache = {};
+let viewPortHeight = 600;
+let scrollTop = 0;
+let defaultItemHeight = 18; // px
+$: visibleSection = calculateVisibleSection(scrollTop, viewPortHeight, json, itemHeightsCache, // warning: itemHeightsCache is mutated and is not responsive itself
+defaultItemHeight);
+// $: debug('visibleSection', visibleSection, { viewPortHeight }) // TODO: cleanup
+$: refreshScrollTop(json);
+// TODO: cleanup
+// $: {
+//   debug('scrollTop', scrollTop, refContents?.scrollTop, refContents?.scrollHeight)
+// }
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function refreshScrollTop(_json) {
+    // When the contents go from lots of items and scrollable contents to only a few items and
+    // no vertical scroll, the actual scrollTop changes to 0 but there is no on:scroll event
+    // triggered, so the internal scrollTop variable is not up-to-date.
+    // This is a workaround to update the scrollTop by triggering an on:scroll event
+    if (refContents) {
+        refContents.scrollTo({
+            top: refContents.scrollTop,
+            left: refContents.scrollLeft
+        });
+    }
+}
+function clearSortedColumn() {
+    if (documentState.sortedColumn) {
+        documentState = {
+            ...documentState,
+            sortedColumn: undefined
+        };
+    }
+}
+function updateSelection(selection) {
+    debug('updateSelection', selection);
+    const updatedSelection = typeof selection === 'function' ? selection(documentState.selection) : selection;
+    if (onSelect)
+        onSelect(updatedSelection);
+    if (!isEqual(updatedSelection, documentState.selection)) {
+        documentState = {
+            ...documentState,
+            selection: updatedSelection
+        };
+    }
+}
+function clearSelectionWhenNotExisting(json) {
+    if (documentState.selection === undefined) {
+        return;
+    }
+    if (documentState.selection &&
+        existsIn(json, documentState.selection.anchorPath) &&
+        existsIn(json, documentState.selection.focusPath)) {
+        return;
+    }
+    debug('clearing selection: path does not exist anymore', documentState.selection);
+    documentState = {
+        ...documentState,
+        selection: getInitialSelection(json, documentState)
+    };
+}
+let documentState = createDocumentState();
+let textIsRepaired = false;
+const searchResultItems = undefined; // TODO: implement support for search and replace
+function onSortByHeader(newSortedColumn) {
+    if (readOnly) {
+        return;
+    }
+    debug('onSortByHeader', newSortedColumn);
+    const rootPath = [];
+    const direction = newSortedColumn.sortDirection === SortDirection.desc ? -1 : 1;
+    const operations = sortJson(json, rootPath, newSortedColumn.path, direction);
+    handlePatch(operations, (patchedJson, patchedState) => {
+        return {
+            state: {
+                ...patchedState,
+                sortedColumn: newSortedColumn
+            }
+        };
+    });
+}
+const history = createHistory({
+    onChange: (state) => {
+        historyState = state;
+    }
+});
+let historyState = history.getState();
+let context;
+$: context = {
+    readOnly,
+    parser,
+    normalization,
+    getJson: () => json,
+    getDocumentState: () => documentState,
+    findElement,
+    findNextInside,
+    focus,
+    onPatch: handlePatch,
+    onSelect: updateSelection,
+    onFind: handleFind,
+    onPasteJson: handlePasteJson,
+    onRenderValue
+};
+function applyExternalContent(content) {
+    const currentContent = { json };
+    const isChanged = isTextContent(content)
+        ? content.text !== text
+        : !isEqual(currentContent.json, content.json);
+    debug('update external content', { isChanged });
+    if (!isChanged) {
+        // no actual change, don't do anything
+        return;
+    }
+    const previousContent = { json, text };
+    const previousJson = json;
+    const previousState = documentState;
+    const previousText = text;
+    const previousTextIsRepaired = textIsRepaired;
+    if (isTextContent(content)) {
+        try {
+            json = parseMemoizeOne(content.text);
+            text = content.text;
+            textIsRepaired = false;
+            parseError = undefined;
+        }
+        catch (err) {
+            try {
+                json = parseMemoizeOne(jsonrepair(content.text));
+                text = content.text;
+                textIsRepaired = true;
+                parseError = undefined;
+            }
+            catch (repairError) {
+                // no valid JSON, will show empty document or invalid json
+                json = undefined;
+                text = externalContent.text;
+                textIsRepaired = false;
+                parseError = normalizeJsonParseError(text, err.message || err.toString());
+            }
+        }
+    }
+    else {
+        json = content.json;
+        text = undefined;
+        textIsRepaired = false;
+        parseError = undefined;
+    }
+    // make sure the selection is valid
+    clearSelectionWhenNotExisting(json);
+    // reset the sorting order (we don't know...)
+    clearSortedColumn();
+    addHistoryItem({
+        previousJson,
+        previousState,
+        previousText,
+        previousTextIsRepaired
+    });
+    // we could work out a patchResult, or use patch(), but only when the previous and new
+    // contents are both json and not text. We go for simplicity and consistency here and
+    // let the function applyExternalContent _not_ return a patchResult ever.
+    const patchResult = null;
+    emitOnChange(previousContent, patchResult);
+}
+// TODO: addHistoryItem is a duplicate of addHistoryItem in TreeMode.svelte. Can we extract and reuse this logic?
+function addHistoryItem({ previousJson, previousState, previousText, previousTextIsRepaired }) {
+    if (previousJson === undefined && previousText === undefined) {
+        // initialization -> do not create a history item
+        return;
+    }
+    if (json !== undefined) {
+        if (previousJson !== undefined) {
+            // regular undo/redo with JSON patch
+            history.add({
+                undo: {
+                    patch: [{ op: 'replace', path: '', value: previousJson }],
+                    state: removeEditModeFromSelection(previousState),
+                    json: undefined,
+                    text: previousText,
+                    textIsRepaired: previousTextIsRepaired
+                },
+                redo: {
+                    patch: [{ op: 'replace', path: '', value: json }],
+                    state: removeEditModeFromSelection(documentState),
+                    json: undefined,
+                    text,
+                    textIsRepaired
+                }
+            });
+        }
+        else {
+            history.add({
+                undo: {
+                    patch: undefined,
+                    json: undefined,
+                    text: previousText,
+                    state: removeEditModeFromSelection(previousState),
+                    textIsRepaired: previousTextIsRepaired
+                },
+                redo: {
+                    patch: undefined,
+                    json,
+                    state: removeEditModeFromSelection(documentState),
+                    text,
+                    textIsRepaired
+                }
+            });
+        }
+    }
+    else {
+        if (previousJson !== undefined) {
+            history.add({
+                undo: {
+                    patch: undefined,
+                    json: previousJson,
+                    state: removeEditModeFromSelection(previousState),
+                    text: previousText,
+                    textIsRepaired: previousTextIsRepaired
+                },
+                redo: {
+                    patch: undefined,
+                    json: undefined,
+                    text,
+                    textIsRepaired,
+                    state: removeEditModeFromSelection(documentState)
+                }
+            });
+        }
+        else {
+            // this cannot happen. Nothing to do, no change
+        }
+    }
+}
+let validationErrors = [];
+$: updateValidationErrors(json, validator, parser, validationParser);
+$: groupedValidationErrors = groupValidationErrors(validationErrors, columns);
+// because onChange returns the validation errors and there is also a separate listener,
+// we would execute validation twice. Memoizing the last result solves this.
+const memoizedValidate = memoizeOne(validateJSON);
+function updateValidationErrors(json, validator, parser, validationParser) {
+    measure(() => {
+        let newValidationErrors;
+        try {
+            newValidationErrors = memoizedValidate(json, validator, parser, validationParser);
+        }
+        catch (err) {
+            newValidationErrors = [
+                {
+                    path: [],
+                    message: 'Failed to validate: ' + err.message,
+                    severity: ValidationSeverity.warning
+                }
+            ];
+        }
+        if (!isEqual(newValidationErrors, validationErrors)) {
+            debug('validationErrors changed:', newValidationErrors);
+            validationErrors = newValidationErrors;
+        }
+    }, (duration) => debug(`validationErrors updated in ${duration} ms`));
+}
+export function validate() {
+    debug('validate');
+    if (parseError) {
+        return {
+            parseError,
+            isRepairable: false // not applicable, if repairable, we will not have a parseError
+        };
+    }
+    // make sure the validation results are up-to-date
+    // normally, they are only updated on the next tick after the json is changed
+    updateValidationErrors(json, validator, parser, validationParser);
+    return {
+        validationErrors
+    };
+}
+export function patch(operations, afterPatch) {
+    debug('patch', operations, afterPatch);
+    if (json === undefined) {
+        throw new Error('Cannot apply patch: no JSON');
+    }
+    const previousContent = { json };
+    const previousJson = json;
+    const previousState = documentState;
+    const previousTextIsRepaired = textIsRepaired;
+    // execute the patch operations
+    const undo = revertJSONPatchWithMoveOperations(json, operations);
+    const patched = documentStatePatch(json, documentState, operations);
+    // Clear the sorted column when needed. We need to do this before `afterPatch`,
+    // else we clear any changed made in the callback. It is a bit odd that
+    // afterPatch does not receive the actual previousDocumentState. Better ideas?
+    const patchedJson = patched.json;
+    const patchedDocumentState = clearSortedColumnWhenAffectedByOperations(documentState, operations, columns);
+    const callback = typeof afterPatch === 'function' ? afterPatch(patchedJson, patchedDocumentState) : undefined;
+    json = callback && callback.json !== undefined ? callback.json : patchedJson;
+    const newState = callback && callback.state !== undefined ? callback.state : patchedDocumentState;
+    documentState = newState;
+    text = undefined;
+    textIsRepaired = false;
+    pastedJson = undefined;
+    history.add({
+        undo: {
+            patch: undo,
+            json: undefined,
+            text: undefined,
+            state: removeEditModeFromSelection(previousState),
+            textIsRepaired: previousTextIsRepaired
+        },
+        redo: {
+            patch: operations,
+            json: undefined,
+            state: removeEditModeFromSelection(newState),
+            text: undefined,
+            textIsRepaired
+        }
+    });
+    const patchResult = {
+        json,
+        previousJson,
+        undo,
+        redo: operations
+    };
+    emitOnChange(previousContent, patchResult);
+    return patchResult;
+}
+function handlePatch(operations, afterPatch) {
+    if (readOnly) {
+        return;
+    }
+    return patch(operations, afterPatch);
+}
+function emitOnChange(previousContent, patchResult) {
+    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+    // @ts-ignore
+    if (previousContent.json === undefined && previousContent?.text === undefined) {
+        // initialization -> do not fire an onChange event
+        return;
+    }
+    // make sure we cannot send an invalid contents like having both
+    // json and text defined, or having none defined
+    if (text !== undefined) {
+        const content = { text, json: undefined };
+        onChange(content, previousContent, {
+            contentErrors: validate(),
+            patchResult
+        });
+    }
+    else if (json !== undefined) {
+        const content = { text: undefined, json };
+        onChange(content, previousContent, {
+            contentErrors: validate(),
+            patchResult
+        });
+    }
+}
+function handleFind(findAndReplace) {
+    debug('handleFind', findAndReplace);
+    // TODO: implement handleFind
+}
+function handlePasteJson(newPastedJson) {
+    debug('pasted json as text', newPastedJson);
+    pastedJson = newPastedJson;
+}
+function findNextInside(path) {
+    const index = parseInt(path[0]);
+    const nextPath = [String(index + 1), ...path.slice(1)];
+    return existsIn(json, nextPath)
+        ? createValueSelection(nextPath, false)
+        : createValueSelection(path, false);
+}
+export function focus() {
+    // with just .focus(), sometimes the input doesn't react on onpaste events
+    // in Chrome when having a large document open and then doing cut/paste.
+    // Calling both .focus() and .select() did solve this issue.
+    if (refHiddenInput) {
+        refHiddenInput.focus();
+        refHiddenInput.select();
+    }
+}
+function handleScroll(event) {
+    scrollTop = event.target['scrollTop'];
+}
+function handleMouseDown(event) {
+    const path = event?.target ? getDataPathFromTarget(event.target) : undefined;
+    if (path) {
+        // when clicking inside the current selection, editing a value, do nothing
+        if (isEditingSelection(documentState.selection) &&
+            isPathInsideSelection(documentState.selection, path, SelectionType.value)) {
+            return;
+        }
+        updateSelection(createValueSelection(path, false));
+        focus();
+        event.preventDefault();
+    }
+}
+function createDefaultSelection() {
+    if (isJSONArray(json) && !isEmpty(json) && !isEmpty(columns)) {
+        // Select the first row, first column
+        const path = ['0', ...columns[0]];
+        return createValueSelection(path, false);
+    }
+    else {
+        return undefined;
+    }
+}
+function createDefaultSelectionWhenUndefined() {
+    if (!documentState.selection) {
+        updateSelection(createDefaultSelection());
+    }
+}
+export function acceptAutoRepair() {
+    if (textIsRepaired && json !== undefined) {
+        const previousState = documentState;
+        const previousJson = json;
+        const previousText = text;
+        const previousContent = { json, text };
+        const previousTextIsRepaired = textIsRepaired;
+        // json stays as is
+        text = undefined;
+        textIsRepaired = false;
+        clearSelectionWhenNotExisting(json);
+        addHistoryItem({
+            previousJson,
+            previousState,
+            previousText,
+            previousTextIsRepaired
+        });
+        // we could work out a patchResult, or use patch(), but only when the previous and new
+        // contents are both json and not text. We go for simplicity and consistency here and
+        // do _not_ return a patchResult ever.
+        const patchResult = null;
+        emitOnChange(previousContent, patchResult);
+    }
+    return { json, text };
+}
+/**
+ * Scroll the window vertically to the node with given path.
+ * Expand the path when needed.
+ */
+export function scrollTo(path, scrollToWhenVisible = true) {
+    const top = calculateAbsolutePosition(path, columns, itemHeightsCache, defaultItemHeight);
+    const roughDistance = top - scrollTop;
+    const elem = findElement(path);
+    debug('scrollTo', { path, top, scrollTop, elem });
+    const viewPortRect = refContents.getBoundingClientRect();
+    if (elem && !scrollToWhenVisible) {
+        const elemRect = elem.getBoundingClientRect();
+        if (elemRect.bottom > viewPortRect.top && elemRect.top < viewPortRect.bottom) {
+            // element is fully or partially visible, don't scroll to it
+            return;
+        }
+    }
+    const offset = -(viewPortRect.height / 4);
+    // FIXME: scroll horizontally when needed
+    // FIXME: scroll to the exact element (rough distance can be inexact)
+    if (elem) {
+        jump(elem, {
+            container: refContents,
+            offset,
+            duration: SCROLL_DURATION,
+            callback: () => {
+                // TODO: improve horizontal scrolling: animate and integrate with the vertical scrolling (jump)
+                scrollToHorizontal(path);
+            }
+        });
+    }
+    else {
+        jump(roughDistance, {
+            container: refContents,
+            offset,
+            duration: SCROLL_DURATION,
+            callback: () => {
+                tick().then(() => {
+                    const newTop = calculateAbsolutePosition(path, columns, itemHeightsCache, defaultItemHeight);
+                    if (newTop !== top) {
+                        scrollTo(path, scrollToWhenVisible);
+                    }
+                    else {
+                        // TODO: improve horizontal scrolling: animate and integrate with the vertical scrolling (jump)
+                        scrollToHorizontal(path);
+                    }
+                });
+            }
+        });
+    }
+}
+function scrollToVertical(path) {
+    const { rowIndex } = toTableCellPosition(path, columns);
+    const top = calculateAbsolutePosition(path, columns, itemHeightsCache, defaultItemHeight);
+    const bottom = top + (itemHeightsCache[rowIndex] || defaultItemHeight);
+    const headerHeight = defaultItemHeight;
+    const viewPortRect = refContents.getBoundingClientRect();
+    const viewPortTop = scrollTop;
+    const viewPortBottom = scrollTop + viewPortRect.height - headerHeight;
+    if (bottom > viewPortBottom) {
+        const diff = bottom - viewPortBottom;
+        refContents.scrollTop += diff;
+    }
+    if (top < viewPortTop) {
+        const diff = viewPortTop - top;
+        refContents.scrollTop -= diff;
+    }
+}
+function scrollToHorizontal(path) {
+    const elem = findElement(path);
+    if (elem) {
+        const viewPortRect = refContents.getBoundingClientRect();
+        const elemRect = elem.getBoundingClientRect(); // TODO: scroll to column instead of item (is always rendered)
+        if (elemRect.right > viewPortRect.right) {
+            const diff = elemRect.right - viewPortRect.right;
+            refContents.scrollLeft += diff;
+        }
+        if (elemRect.left < viewPortRect.left) {
+            const diff = viewPortRect.left - elemRect.left;
+            refContents.scrollLeft -= diff;
+        }
+    }
+}
+function scrollIntoView(path) {
+    scrollToVertical(path);
+    scrollToHorizontal(path);
+}
+/**
+ * Find the DOM element of a given path.
+ * Note that the path can only be found when the node is expanded.
+ */
+export function findElement(path) {
+    return refContents ? refContents.querySelector(`td[data-path="${encodeDataPath(path)}"]`) : null;
+}
+function openContextMenu({ anchor, left, top, width, height, offsetTop, offsetLeft, showTip }) {
+    const props = {
+        json,
+        documentState: documentState,
+        parser,
+        showTip,
+        onEditValue: handleEditValue,
+        onToggleEnforceString: handleToggleEnforceString,
+        onCut: handleCut,
+        onCopy: handleCopy,
+        onPaste: handlePasteFromMenu,
+        onRemove: handleRemove,
+        onCloseContextMenu: function () {
+            closeAbsolutePopup(popupId);
+            focus();
+        }
+    };
+    modalOpen = true;
+    const popupId = openAbsolutePopup(TableContextMenu, props, {
+        left,
+        top,
+        offsetTop,
+        offsetLeft,
+        width,
+        height,
+        anchor,
+        closeOnOuterClick: true,
+        onClose: () => {
+            modalOpen = false;
+            focus();
+        }
+    });
+}
+function handleContextMenu(event) {
+    if (readOnly || isEditingSelection(documentState.selection)) {
+        return;
+    }
+    if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+    }
+    if (event && event.type === 'contextmenu' && event.target !== refHiddenInput) {
+        // right mouse click to open context menu
+        openContextMenu({
+            left: event.clientX,
+            top: event.clientY,
+            width: CONTEXT_MENU_WIDTH,
+            height: CONTEXT_MENU_HEIGHT,
+            showTip: false
+        });
+    }
+    else {
+        // type === 'keydown' (from the quick key Ctrl+Q)
+        // or target is hidden input -> context menu button on keyboard
+        const anchor = refContents?.querySelector('.jse-table-cell.jse-selected-value');
+        if (anchor) {
+            openContextMenu({
+                anchor,
+                offsetTop: 2,
+                width: CONTEXT_MENU_WIDTH,
+                height: CONTEXT_MENU_HEIGHT,
+                showTip: false
+            });
+        }
+        else {
+            // fallback on just displaying the TreeContextMenu top left
+            const rect = refContents?.getBoundingClientRect();
+            if (rect) {
+                openContextMenu({
+                    top: rect.top + 2,
+                    left: rect.left + 2,
+                    width: CONTEXT_MENU_WIDTH,
+                    height: CONTEXT_MENU_HEIGHT,
+                    showTip: false
+                });
+            }
+        }
+    }
+    return false;
+}
+function handleContextMenuFromTableMenu(event) {
+    if (readOnly) {
+        return;
+    }
+    openContextMenu({
+        anchor: findParentWithNodeName(event.target, 'BUTTON'),
+        offsetTop: 0,
+        width: CONTEXT_MENU_WIDTH,
+        height: CONTEXT_MENU_HEIGHT,
+        showTip: true
+    });
+}
+function handleEditValue() {
+    if (readOnly || !documentState.selection) {
+        return;
+    }
+    const path = documentState.selection.focusPath;
+    const value = getIn(json, path);
+    if (isObjectOrArray(value)) {
+        openJSONEditorModal(path);
+    }
+    else {
+        updateSelection(createValueSelection(path, true));
+    }
+}
+function handleToggleEnforceString() {
+    if (readOnly || !isValueSelection(documentState.selection)) {
+        return;
+    }
+    const path = documentState.selection.focusPath;
+    const pointer = compileJSONPointer(path);
+    const value = getIn(json, path);
+    const enforceString = !getEnforceString(value, documentState.enforceStringMap, pointer, parser);
+    const updatedValue = enforceString ? String(value) : stringConvert(String(value), parser);
+    debug('handleToggleEnforceString', { enforceString, value, updatedValue });
+    handlePatch([
+        {
+            op: 'replace',
+            path: pointer,
+            value: updatedValue
+        }
+    ], (patchedJson, patchedState) => {
+        return {
+            state: setEnforceString(patchedState, pointer, enforceString)
+        };
+    });
+}
+async function handleParsePastedJson() {
+    debug('apply pasted json', pastedJson);
+    const { path, contents } = pastedJson;
+    // exit edit mode
+    updateSelection(createValueSelection(path, false));
+    await tick();
+    // replace the value with the JSON object/array
+    const operations = [
+        {
+            op: 'replace',
+            path: compileJSONPointer(path),
+            value: contents
+        }
+    ];
+    handlePatch(operations);
+}
+function handlePasteFromMenu() {
+    open(CopyPasteModal, {}, {
+        ...SIMPLE_MODAL_OPTIONS,
+        styleWindow: {
+            width: '450px'
+        }
+    }, {
+        onClose: () => focus()
+    });
+}
+function handleClearPastedJson() {
+    debug('clear pasted json');
+    pastedJson = undefined;
+}
+function handleRequestRepair() {
+    onChangeMode(Mode.text);
+}
+async function handleCut(indent) {
+    await onCut({
+        json,
+        documentState,
+        indentation: indent ? indentation : undefined,
+        readOnly,
+        parser,
+        onPatch: handlePatch
+    });
+}
+async function handleCopy(indent = true) {
+    await onCopy({
+        json,
+        documentState,
+        indentation: indent ? indentation : undefined,
+        parser
+    });
+}
+function handleRemove() {
+    onRemove({
+        json,
+        text,
+        documentState,
+        keepSelection: true,
+        readOnly,
+        onChange,
+        onPatch: handlePatch
+    });
+}
+async function handleInsertCharacter(char) {
+    await onInsertCharacter({
+        char,
+        selectInside: false,
+        refJsonEditor,
+        json,
+        documentState,
+        readOnly,
+        parser,
+        onPatch: handlePatch,
+        onReplaceJson: handleReplaceJson,
+        onSelect: updateSelection
+    });
+}
+function handleKeyDown(event) {
+    // get key combo, and normalize key combo from Mac: replace "Command+X" with "Ctrl+X" etc
+    const combo = keyComboFromEvent(event).replace(/^Command\+/, 'Ctrl+');
+    debug('keydown', { combo, key: event.key });
+    if (combo === 'Ctrl+X') {
+        // cut formatted
+        event.preventDefault();
+        handleCut(true);
+    }
+    if (combo === 'Ctrl+Shift+X') {
+        // cut compact
+        event.preventDefault();
+        handleCut(false);
+    }
+    if (combo === 'Ctrl+C') {
+        // copy formatted
+        event.preventDefault();
+        handleCopy(true);
+    }
+    if (combo === 'Ctrl+Shift+C') {
+        // copy compact
+        event.preventDefault();
+        handleCopy(false);
+    }
+    // Note: Ctrl+V (paste) is handled by the on:paste event
+    if (combo === 'Ctrl+D') {
+        event.preventDefault();
+        // handleDuplicate()
+        // TODO: implement duplicate
+    }
+    if (combo === 'Delete' || combo === 'Backspace') {
+        event.preventDefault();
+        handleRemove();
+    }
+    if (combo === 'Insert') {
+        event.preventDefault();
+        // TODO: implement insert
+    }
+    if (combo === 'Ctrl+A') {
+        event.preventDefault();
+        // updateSelection(selectAll())
+        // TODO: implement select all
+    }
+    if (combo === 'Ctrl+Q') {
+        handleContextMenu(event);
+    }
+    if (combo === 'Left') {
+        event.preventDefault();
+        createDefaultSelectionWhenUndefined();
+        if (documentState.selection) {
+            const newSelection = selectPreviousColumn(columns, documentState.selection);
+            updateSelection(newSelection);
+            scrollIntoView(newSelection.focusPath);
+        }
+    }
+    if (combo === 'Right') {
+        event.preventDefault();
+        createDefaultSelectionWhenUndefined();
+        if (documentState.selection) {
+            const newSelection = selectNextColumn(columns, documentState.selection);
+            updateSelection(newSelection);
+            scrollIntoView(newSelection.focusPath);
+        }
+    }
+    if (combo === 'Up') {
+        event.preventDefault();
+        createDefaultSelectionWhenUndefined();
+        if (documentState.selection) {
+            const newSelection = selectPreviousRow(columns, documentState.selection);
+            updateSelection(newSelection);
+            scrollIntoView(newSelection.focusPath);
+        }
+    }
+    if (combo === 'Down') {
+        event.preventDefault();
+        createDefaultSelectionWhenUndefined();
+        if (documentState.selection) {
+            const newSelection = selectNextRow(json, columns, documentState.selection);
+            updateSelection(newSelection);
+            scrollIntoView(newSelection.focusPath);
+        }
+    }
+    if (combo === 'Enter' && documentState.selection) {
+        if (isValueSelection(documentState.selection)) {
+            event.preventDefault();
+            const path = documentState.selection.focusPath;
+            const value = getIn(json, path);
+            if (isObjectOrArray(value)) {
+                // edit nested object/array
+                openJSONEditorModal(path);
+            }
+            else {
+                if (!readOnly) {
+                    // go to value edit mode
+                    updateSelection({ ...documentState.selection, edit: true });
+                }
+            }
+        }
+    }
+    const normalizedCombo = combo
+        .replace(/^Shift\+/, '') // replace 'Shift+A' with 'A'
+        .replace(/^Numpad_/, ''); // replace 'Numpad_4' with '4'
+    if (normalizedCombo.length === 1 && documentState.selection) {
+        // a regular key like a, A, _, etc is entered.
+        // Replace selected contents with a new value having this first character as text
+        event.preventDefault();
+        handleInsertCharacter(event.key);
+        return;
+    }
+    if (combo === 'Ctrl+Enter' && isValueSelection(documentState.selection)) {
+        const value = getIn(json, documentState.selection.focusPath);
+        if (isUrl(value)) {
+            // open url in new page
+            window.open(String(value), '_blank');
+        }
+    }
+    if (combo === 'Escape' && documentState.selection) {
+        event.preventDefault();
+        updateSelection(undefined);
+    }
+    if (combo === 'Ctrl+F') {
+        event.preventDefault();
+        // openFind(false)
+        // TODO: implement find
+    }
+    if (combo === 'Ctrl+H') {
+        event.preventDefault();
+        // openFind(true)
+        // TODO: implement find and replace
+    }
+    if (combo === 'Ctrl+Z') {
+        event.preventDefault();
+        handleUndo();
+    }
+    if (combo === 'Ctrl+Shift+Z') {
+        event.preventDefault();
+        handleRedo();
+    }
+}
+function handlePaste(event) {
+    event.preventDefault();
+    const clipboardText = event.clipboardData.getData('text/plain');
+    onPaste({
+        clipboardText,
+        json,
+        documentState,
+        readOnly,
+        parser,
+        onPatch: handlePatch,
+        onChangeText: handleChangeText,
+        openRepairModal
+    });
+}
+// TODO: this function is duplicated from TreeMode. See if we can reuse the code instead
+function handleReplaceJson(updatedJson, afterPatch) {
+    const previousState = documentState;
+    const previousJson = json;
+    const previousText = text;
+    const previousContent = { json, text };
+    const previousTextIsRepaired = textIsRepaired;
+    const updatedState = expandWithCallback(json, documentState, [], expandMinimal);
+    const callback = typeof afterPatch === 'function' ? afterPatch(updatedJson, updatedState) : undefined;
+    json = callback && callback.json !== undefined ? callback.json : updatedJson;
+    documentState = callback && callback.state !== undefined ? callback.state : updatedState;
+    text = undefined;
+    textIsRepaired = false;
+    // make sure the selection is valid
+    clearSelectionWhenNotExisting(json);
+    addHistoryItem({
+        previousJson,
+        previousState,
+        previousText,
+        previousTextIsRepaired
+    });
+    // we could work out a patchResult, or use patch(), but only when the previous and new
+    // contents are both json and not text. We go for simplicity and consistency here and
+    // do _not_ return a patchResult ever.
+    const patchResult = null;
+    emitOnChange(previousContent, patchResult);
+}
+// TODO: this function is duplicated from TreeMode. See if we can reuse the code instead
+function handleChangeText(updatedText, afterPatch) {
+    debug('handleChangeText');
+    const previousState = documentState;
+    const previousJson = json;
+    const previousText = text;
+    const previousContent = { json, text };
+    const previousTextIsRepaired = textIsRepaired;
+    try {
+        json = parseMemoizeOne(updatedText);
+        documentState = expandWithCallback(json, documentState, [], expandMinimal);
+        text = undefined;
+        textIsRepaired = false;
+    }
+    catch (err) {
+        try {
+            json = parseMemoizeOne(jsonrepair(updatedText));
+            documentState = expandWithCallback(json, documentState, [], expandMinimal);
+            text = updatedText;
+            textIsRepaired = true;
+        }
+        catch (err) {
+            // no valid JSON, will show empty document or invalid json
+            json = undefined;
+            documentState = createDocumentState({ json, expand: expandMinimal });
+            text = updatedText;
+            textIsRepaired = false;
+        }
+    }
+    if (typeof afterPatch === 'function') {
+        const callback = afterPatch(json, documentState);
+        json = callback && callback.json ? callback.json : json;
+        documentState = callback && callback.state ? callback.state : documentState;
+    }
+    // ensure the selection is valid
+    clearSelectionWhenNotExisting(json);
+    addHistoryItem({
+        previousJson,
+        previousState,
+        previousText,
+        previousTextIsRepaired
+    });
+    // no JSON patch actions available in text mode
+    const patchResult = null;
+    emitOnChange(previousContent, patchResult);
+}
+function handleSelectValidationError(error) {
+    debug('select validation error', error);
+    updateSelection(createValueSelection(error.path, false));
+    scrollTo(error.path);
+}
+function openSortModal(rootPath) {
+    if (readOnly) {
+        return;
+    }
+    modalOpen = true;
+    onSortModal({
+        id: sortModalId,
+        json,
+        rootPath,
+        onSort: async ({ operations, itemPath, direction }) => {
+            debug('onSort', operations, rootPath, itemPath, direction);
+            handlePatch(operations, (patchedJson, patchedState) => {
+                return {
+                    state: {
+                        ...patchedState,
+                        sortedColumn: {
+                            path: itemPath,
+                            sortDirection: direction === -1 ? SortDirection.desc : SortDirection.asc
+                        }
+                    }
+                };
+            });
+        },
+        onClose: () => {
+            modalOpen = false;
+            focus();
+        }
+    });
+}
+/**
+ * This method is exposed via JSONEditor.transform
+ */
+export function openTransformModal({ id, rootPath, onTransform, onClose }) {
+    modalOpen = true;
+    onTransformModal({
+        id: id || transformModalId,
+        json,
+        rootPath,
+        onTransform: onTransform
+            ? (operations) => {
+                onTransform({
+                    operations,
+                    json,
+                    transformedJson: immutableJSONPatch(json, operations)
+                });
+            }
+            : (operations) => {
+                debug('onTransform', rootPath, operations);
+                handlePatch(operations);
+            },
+        onClose: () => {
+            modalOpen = false;
+            focus();
+            if (onClose) {
+                onClose();
+            }
+        }
+    });
+}
+function openJSONEditorModal(path) {
+    debug('openJSONEditorModal', { path });
+    modalOpen = true;
+    // open a popup where you can edit the nested object/array
+    onJSONEditorModal({
+        content: {
+            json: getIn(json, path)
+        },
+        path,
+        onPatch: context.onPatch,
+        onClose: () => {
+            modalOpen = false;
+            focus();
+        }
+    });
+}
+function openRepairModal(text, onApply) {
+    open(JSONRepairModal, {
+        text,
+        onParse: parsePartialJson,
+        onRepair: repairPartialJson,
+        onApply
+    }, {
+        ...SIMPLE_MODAL_OPTIONS,
+        styleWindow: {
+            width: '600px',
+            height: '500px'
+        },
+        styleContent: {
+            padding: 0,
+            height: '100%'
+        }
+    }, {
+        onClose: () => focus()
+    });
+}
+function handleSortAll() {
+    const rootPath = [];
+    openSortModal(rootPath);
+}
+function handleTransformAll() {
+    openTransformModal({
+        rootPath: []
+    });
+}
+function handleUndo() {
+    if (readOnly) {
+        return;
+    }
+    if (!history.getState().canUndo) {
+        return;
+    }
+    const item = history.undo();
+    if (!item) {
+        return;
+    }
+    const previousContent = { json, text };
+    json = item.undo.patch ? immutableJSONPatch(json, item.undo.patch) : item.undo.json;
+    documentState = item.undo.state;
+    text = item.undo.text;
+    textIsRepaired = item.undo.textIsRepaired;
+    debug('undo', { item, json });
+    const patchResult = {
+        json,
+        previousJson: previousContent.json,
+        redo: item.undo.patch,
+        undo: item.redo.patch
+    };
+    emitOnChange(previousContent, patchResult);
+    focus();
+    if (documentState.selection) {
+        scrollTo(documentState.selection.focusPath, false);
+    }
+}
+function handleRedo() {
+    if (readOnly) {
+        return;
+    }
+    if (!history.getState().canRedo) {
+        return;
+    }
+    const item = history.redo();
+    if (!item) {
+        return;
+    }
+    const previousContent = { json, text };
+    json = item.redo.patch ? immutableJSONPatch(json, item.redo.patch) : item.redo.json;
+    documentState = item.redo.state;
+    text = item.redo.text;
+    textIsRepaired = item.redo.textIsRepaired;
+    debug('redo', { item, json });
+    const patchResult = {
+        json,
+        previousJson: previousContent.json,
+        redo: item.redo.patch,
+        undo: item.undo.patch
+    };
+    emitOnChange(previousContent, patchResult);
+    focus();
+    if (documentState.selection) {
+        scrollTo(documentState.selection.focusPath, false);
+    }
+}
+function handleResizeContents(element) {
+    viewPortHeight = element.getBoundingClientRect().height;
+}
+function handleResizeRow(element, rowIndex) {
+    itemHeightsCache[rowIndex] = element.getBoundingClientRect().height;
+}
+function isPathSelected(path, selection) {
+    return selection ? selection.pointersMap[compileJSONPointer(path)] === true : false;
+}
+</script>
+
+<div
+  class="jse-table-mode"
+  class:no-main-menu={!mainMenuBar}
+  on:mousedown={handleMouseDown}
+  on:keydown={handleKeyDown}
+  on:contextmenu={handleContextMenu}
+  bind:this={refJsonEditor}
+>
+  {#if mainMenuBar}
+    <TableMenu
+      {json}
+      {readOnly}
+      {historyState}
+      onSort={handleSortAll}
+      onTransform={handleTransformAll}
+      onUndo={handleUndo}
+      onRedo={handleRedo}
+      onContextMenu={handleContextMenuFromTableMenu}
+      {onRenderMenu}
+    />
+  {/if}
+
+  {#if !isSSR}
+    <label class="jse-hidden-input-label">
+      <input
+        type="text"
+        readonly="readonly"
+        tabindex="-1"
+        class="jse-hidden-input"
+        bind:this={refHiddenInput}
+        on:paste={handlePaste}
+      />
+    </label>
+    {#if containsValidArray}
+      <div
+        class="jse-contents"
+        bind:this={refContents}
+        use:resizeObserver={handleResizeContents}
+        on:scroll={handleScroll}
+      >
+        <table class="jse-table-main" cellpadding="0" cellspacing="0">
+          <tbody>
+            <tr class="jse-table-row jse-table-row-header">
+              <th class="jse-table-cell jse-table-cell-header">
+                {#if !isEmpty(groupedValidationErrors?.root)}
+                  <div class="jse-table-root-error">
+                    <ValidationErrorIcon
+                      validationError={mergeValidationErrors([], groupedValidationErrors?.root)}
+                      onExpand={noop}
+                    />
+                  </div>
+                {/if}
+              </th>
+              {#each columns as column}
+                <th class="jse-table-cell jse-table-cell-header">
+                  <ColumnHeader
+                    path={column}
+                    sortedColumn={documentState.sortedColumn}
+                    {readOnly}
+                    onSort={onSortByHeader}
+                  />
+                </th>
+              {/each}
+            </tr>
+            <tr class="jse-table-invisible-start-section">
+              <td style:height={visibleSection.startHeight + 'px'} colspan={columns.length} />
+            </tr>
+            {#each visibleSection.visibleItems as item, visibleIndex}
+              {@const rowIndex = visibleSection.startIndex + visibleIndex}
+              {@const validationErrorsByRow = groupedValidationErrors.rows[rowIndex]}
+              <tr class="jse-table-row">
+                {#key rowIndex}
+                  <th
+                    class="jse-table-cell jse-table-cell-gutter"
+                    use:resizeObserver={(element) => handleResizeRow(element, rowIndex)}
+                  >
+                    {rowIndex + 1}
+                    {#if !isEmpty(validationErrorsByRow?.row)}
+                      <ValidationErrorIcon
+                        validationError={mergeValidationErrors(
+                          [String(rowIndex)],
+                          validationErrorsByRow.row
+                        )}
+                        onExpand={noop}
+                      />
+                    {/if}
+                  </th>
+                {/key}
+                {#each columns as column, columnIndex}
+                  {@const path = [String(rowIndex)].concat(column)}
+                  {@const value = getIn(item, column)}
+                  {@const isSelected = isPathSelected(path, documentState.selection)}
+                  {@const validationErrorsByColumn = validationErrorsByRow?.columns[columnIndex]}
+                  <td
+                    class="jse-table-cell"
+                    data-path={encodeDataPath(path)}
+                    class:jse-selected-value={isSelected &&
+                      isValueSelection(documentState.selection)}
+                  >
+                    {#if isObjectOrArray(value)}
+                      <InlineValue
+                        {path}
+                        {value}
+                        {parser}
+                        {isSelected}
+                        onEdit={openJSONEditorModal}
+                      />{:else}
+                      <JSONValueComponent
+                        {path}
+                        value={value !== undefined ? value : ''}
+                        enforceString={getEnforceString(
+                          value,
+                          documentState.enforceStringMap,
+                          compileJSONPointer(path),
+                          context.parser
+                        )}
+                        selection={isSelected ? documentState.selection : undefined}
+                        {searchResultItems}
+                        {context}
+                      />{/if}{#if !readOnly && isSelected && !documentState.selection.edit}
+                      <div class="jse-context-menu-anchor">
+                        <ContextMenuPointer selected={true} onContextMenu={openContextMenu} />
+                      </div>
+                    {/if}{#if !isEmpty(validationErrorsByColumn)}
+                      <ValidationErrorIcon
+                        validationError={mergeValidationErrors(path, validationErrorsByColumn)}
+                        onExpand={noop}
+                      />
+                    {/if}
+                  </td>
+                {/each}
+              </tr>
+            {/each}
+
+            <tr class="jse-table-invisible-end-section">
+              <td style:height={visibleSection.endHeight + 'px'} colspan={columns.length} />
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      {#if pastedJson}
+        <Message
+          type="info"
+          message={`You pasted a JSON ${
+            Array.isArray(pastedJson.contents) ? 'array' : 'object'
+          } as text`}
+          actions={[
+            {
+              icon: faWrench,
+              text: 'Paste as JSON instead',
+              // We use mousedown here instead of click: this message pops up
+              // whilst the user is editing a value. When clicking this button,
+              // the actual value is applied and the event is not propagated
+              // and an onClick on this button never happens.
+              onMouseDown: handleParsePastedJson
+            },
+            {
+              text: 'Leave as is',
+              onClick: handleClearPastedJson
+            }
+          ]}
+        />
+      {/if}
+
+      {#if textIsRepaired}
+        <Message
+          type="success"
+          message="The loaded JSON document was invalid but is successfully repaired."
+          actions={!readOnly
+            ? [
+                {
+                  icon: faCheck,
+                  text: 'Ok',
+                  onClick: acceptAutoRepair
+                },
+                {
+                  icon: faCode,
+                  text: 'Repair manually instead',
+                  onClick: handleRequestRepair
+                }
+              ]
+            : []}
+        />
+      {/if}
+
+      <ValidationErrorsOverview {validationErrors} selectError={handleSelectValidationError} />
+    {:else if parseError && text !== undefined && text !== ''}
+      <Message
+        type="error"
+        message="The loaded JSON document is invalid and could not be repaired automatically."
+        actions={!readOnly
+          ? [
+              {
+                icon: faCode,
+                text: 'Repair manually',
+                onClick: handleRequestRepair
+              }
+            ]
+          : []}
+      />
+      <JSONPreview text={text || ''} {json} {indentation} {parser} />
+    {:else}
+      <TableModeWelcome {text} {json} {readOnly} {parser} {openJSONEditorModal} {onChangeMode} />
+    {/if}
+  {:else}
+    <div class="jse-contents jse-contents-loading">
+      <div class="jse-loading-space" />
+      <div class="jse-loading">loading...</div>
+    </div>
+  {/if}
+</div>
+
+<style src="./TableMode.scss">.jse-table-mode {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  background: var(--jse-background-color);
+  min-width: 0;
+  min-height: 0;
+  font-family: var(--jse-font-family-mono);
+  font-size: var(--jse-font-size-mono);
+  color: var(--jse-text-color);
+}
+.jse-table-mode.no-main-menu {
+  border-top: var(--jse-main-border);
+}
+.jse-table-mode .jse-hidden-input-label {
+  position: fixed;
+  right: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+}
+.jse-table-mode .jse-hidden-input-label .jse-hidden-input {
+  width: 0;
+  height: 0;
+  padding: 0;
+  border: 0;
+  outline: none;
+}
+.jse-table-mode .jse-contents {
+  flex: 1;
+  align-items: start;
+  flex-direction: column;
+  display: flex;
+  overflow: auto;
+  overflow-anchor: none;
+  border-left: var(--jse-main-border);
+  border-right: var(--jse-main-border);
+}
+.jse-table-mode .jse-contents:last-child {
+  border-bottom: var(--jse-main-border);
+}
+.jse-table-mode .jse-contents table.jse-table-main {
+  border-collapse: collapse;
+  border-spacing: 0;
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-invisible-start-section td,
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-invisible-end-section td {
+  margin: 0;
+  padding: 0;
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-invisible-end-section td {
+  padding-bottom: var(--jse-padding);
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-row:hover {
+  background-color: var(--jse-table-row-odd-background);
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-row .jse-table-cell {
+  padding: 0 var(--jse-padding) 0 0;
+  vertical-align: top;
+  white-space: nowrap;
+  height: var(--jse-line-height);
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-row .jse-table-cell.jse-table-cell-header, .jse-table-mode .jse-contents table.jse-table-main .jse-table-row .jse-table-cell.jse-table-cell-gutter {
+  font-weight: normal;
+  text-align: left;
+  color: var(--jse-text-readonly);
+  background: var(--jse-table-header-background);
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-row .jse-table-cell.jse-table-cell-header {
+  padding: 0;
+  position: sticky;
+  top: 0;
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-row .jse-table-cell.jse-table-cell-header .jse-table-root-error {
+  padding: calc(0.5 * var(--jse-padding)) var(--jse-padding) calc(0.5 * var(--jse-padding)) calc(0.5 * var(--jse-padding));
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-row .jse-table-cell.jse-table-cell-gutter {
+  padding: 0 var(--jse-padding) 0 calc(0.5 * var(--jse-padding));
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-row .jse-table-cell.jse-selected-value > :global(.jse-value) {
+  background: var(--jse-selection-background-color);
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-row .jse-table-cell :global(div) {
+  display: inline-flex;
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-row .jse-table-cell :global(div.jse-value) {
+  overflow-wrap: normal;
+  white-space: nowrap;
+  vertical-align: top;
+  display: inline-block;
+}
+.jse-table-mode .jse-contents table.jse-table-main .jse-table-row .jse-table-cell .jse-context-menu-anchor {
+  position: relative;
+  vertical-align: top;
+}
+.jse-table-mode .jse-contents.jse-contents-loading {
+  align-items: unset;
+}
+.jse-table-mode .jse-contents.jse-contents-loading .jse-loading-space {
+  flex: 1;
+}
+.jse-table-mode .jse-contents.jse-contents-loading .jse-loading {
+  flex: 2;
+  text-align: center;
+  color: var(--jse-panel-color-readonly);
+  box-sizing: border-box;
+  font-family: var(--jse-font-family);
+  font-size: var(--jse-font-size);
+}</style>

@@ -1,0 +1,1 @@
+export { default as component } from "../../../src/routes/examples/json_schema_validation/+page.svelte";

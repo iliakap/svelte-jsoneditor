@@ -1,0 +1,271 @@
+import { compileJSONPointer, isJSONArray, isJSONObject, parseJSONPointer } from 'immutable-json-patch';
+import { groupBy, isEmpty, isEqual, mapValues, partition } from 'lodash-es';
+import { createValueSelection, pathStartsWith } from './selection.js';
+import { isNumber } from '../utils/numberUtils.js';
+import { stringifyJSONPath, stripRootObject } from '../utils/pathUtils.js';
+import { ValidationSeverity } from '../types.js';
+export function getColumns(array, flatten, maxLookupCount = Math.min(isJSONArray(array) ? array.length : 0, 100)) {
+    const compiledPaths = new Set();
+    for (let i = 0; i < maxLookupCount; i++) {
+        const paths = flatten ? getRecursiveKeys(array[i]) : getShallowKeys(array[i]);
+        paths.forEach((path) => compiledPaths.add(compileJSONPointer(path)));
+    }
+    return Array.from(compiledPaths).map(parseJSONPointer);
+}
+export function getShallowKeys(value) {
+    return isJSONObject(value) ? Object.keys(value).map((key) => [key]) : [[]];
+}
+export function getRecursiveKeys(value) {
+    const paths = [];
+    function recurse(value, path) {
+        if (isJSONObject(value)) {
+            Object.keys(value).forEach((key) => {
+                recurse(value[key], path.concat(key));
+            });
+        }
+        else {
+            // array or primitive value like string or number
+            paths.push(path);
+        }
+    }
+    recurse(value, []);
+    return paths;
+}
+// TODO: write unit tests
+export function calculateVisibleSection(scrollTop, viewPortHeight, json, itemHeights, defaultItemHeight, margin = 80) {
+    const itemCount = isJSONArray(json) ? json.length : 0;
+    const averageItemHeight = calculateAverageItemHeight(itemHeights, defaultItemHeight);
+    const viewPortTop = scrollTop - margin;
+    const viewPortBottom = viewPortHeight + 2 * margin;
+    const getItemHeight = (index) => itemHeights[index] || defaultItemHeight;
+    let startIndex = 0;
+    let startHeight = 0;
+    while (startHeight < viewPortTop && startIndex < itemCount) {
+        startHeight += getItemHeight(startIndex);
+        startIndex++;
+    }
+    if (startIndex > 0) {
+        // go one item back, else there is white space at the top for up to 1 missing item
+        startIndex--;
+        startHeight -= getItemHeight(startIndex);
+    }
+    let endIndex = startIndex;
+    let visibleHeight = 0;
+    while (visibleHeight < viewPortBottom && endIndex < itemCount) {
+        visibleHeight += getItemHeight(endIndex);
+        endIndex++;
+    }
+    let endHeight = 0;
+    for (let i = endIndex; i < itemCount; i++) {
+        endHeight += getItemHeight(i);
+    }
+    const visibleItems = isJSONArray(json) ? json.slice(startIndex, endIndex) : [];
+    return {
+        startIndex,
+        endIndex,
+        startHeight,
+        endHeight,
+        averageItemHeight,
+        visibleHeight,
+        visibleItems
+    };
+}
+// TODO: cleanup if we will not use it in the end
+// TODO: write unit tests
+export function calculateVisibleSectionApprox(scrollTop, viewPortHeight, json, defaultItemHeight) {
+    const itemCount = isJSONArray(json) ? json.length : 0;
+    const averageItemHeight = defaultItemHeight;
+    const viewPortTop = scrollTop;
+    const startIndex = Math.floor(viewPortTop / defaultItemHeight);
+    const startHeight = startIndex * defaultItemHeight;
+    const endIndex = Math.ceil((viewPortTop + viewPortHeight) / defaultItemHeight);
+    const visibleHeight = (endIndex - startIndex) * defaultItemHeight;
+    const endHeight = (itemCount - endIndex) * defaultItemHeight;
+    const visibleItems = isJSONArray(json) ? json.slice(startIndex, endIndex) : [];
+    return {
+        startIndex,
+        endIndex,
+        startHeight,
+        endHeight,
+        averageItemHeight,
+        visibleHeight,
+        visibleItems
+    };
+}
+// TODO: write unit tests
+export function calculateAbsolutePosition(path, columns, itemHeights, defaultItemHeight) {
+    const { rowIndex } = toTableCellPosition(path, columns);
+    let top = 0;
+    for (let currentIndex = 0; currentIndex < rowIndex; currentIndex++) {
+        top += itemHeights[currentIndex] || defaultItemHeight;
+    }
+    // TODO: also calculate left
+    return top;
+}
+function calculateAverageItemHeight(itemHeights, defaultItemHeight) {
+    const values = Object.values(itemHeights); // warning: itemHeights is mutated and not updated itself, we can't watch it!
+    if (isEmpty(values)) {
+        return defaultItemHeight;
+    }
+    const add = (a, b) => a + b;
+    const total = values.reduce(add);
+    return total / values.length;
+}
+export function selectPreviousRow(columns, selection) {
+    const { rowIndex, columnIndex } = toTableCellPosition(selection.focusPath, columns);
+    if (rowIndex > 0) {
+        const previousPosition = { rowIndex: rowIndex - 1, columnIndex };
+        const previousPath = fromTableCellPosition(previousPosition, columns);
+        return createValueSelection(previousPath, false);
+    }
+    return selection;
+}
+export function selectNextRow(json, columns, selection) {
+    const { rowIndex, columnIndex } = toTableCellPosition(selection.focusPath, columns);
+    if (rowIndex < json.length - 1) {
+        const nextPosition = { rowIndex: rowIndex + 1, columnIndex };
+        const nextPath = fromTableCellPosition(nextPosition, columns);
+        return createValueSelection(nextPath, false);
+    }
+    return selection;
+}
+export function selectPreviousColumn(columns, selection) {
+    const { rowIndex, columnIndex } = toTableCellPosition(selection.focusPath, columns);
+    if (columnIndex > 0) {
+        const previousPosition = { rowIndex, columnIndex: columnIndex - 1 };
+        const previousPath = fromTableCellPosition(previousPosition, columns);
+        return createValueSelection(previousPath, false);
+    }
+    return selection;
+}
+export function selectNextColumn(columns, selection) {
+    const { rowIndex, columnIndex } = toTableCellPosition(selection.focusPath, columns);
+    if (columnIndex < columns.length - 1) {
+        const nextPosition = { rowIndex, columnIndex: columnIndex + 1 };
+        const nextPath = fromTableCellPosition(nextPosition, columns);
+        return createValueSelection(nextPath, false);
+    }
+    return selection;
+}
+export function toTableCellPosition(path, columns) {
+    const [index, ...column] = path;
+    const rowIndex = parseInt(index, 10);
+    return {
+        rowIndex: !isNaN(rowIndex) ? rowIndex : -1,
+        columnIndex: columns.findIndex((c) => pathStartsWith(column, c))
+    };
+}
+export function fromTableCellPosition(position, columns) {
+    const { rowIndex, columnIndex } = position;
+    return [String(rowIndex), ...columns[columnIndex]];
+}
+export function stringifyTableCellPosition(position) {
+    const { rowIndex, columnIndex } = position;
+    return `${rowIndex}:${columnIndex}`;
+}
+/**
+ * Group validation errors for use in the Table view: per column, and a group for the row as a whole
+ */
+export function groupValidationErrors(validationErrors, columns) {
+    const [arrayErrors, rootErrors] = partition(validationErrors, (validationError) => isNumber(validationError.path[0]));
+    const errorsByRow = groupBy(arrayErrors, findRowIndex);
+    const groupedErrorsByRow = mapValues(errorsByRow, (errors) => {
+        const groupByRow = {
+            row: [],
+            columns: {}
+        };
+        errors.forEach((error) => {
+            const columnIndex = findColumnIndex(error, columns);
+            if (columnIndex !== -1) {
+                if (groupByRow.columns[columnIndex] === undefined) {
+                    groupByRow.columns[columnIndex] = [];
+                }
+                groupByRow.columns[columnIndex].push(error);
+            }
+            else {
+                groupByRow.row.push(error);
+            }
+        });
+        return groupByRow;
+    });
+    return {
+        root: rootErrors,
+        rows: groupedErrorsByRow
+    };
+}
+export function mergeValidationErrors(path, validationErrors) {
+    if (!validationErrors || validationErrors.length === 0) {
+        return undefined;
+    }
+    if (validationErrors.length === 1) {
+        return validationErrors[0];
+    }
+    return {
+        path,
+        message: 'Multiple validation issues: ' +
+            validationErrors
+                .map((error) => {
+                return stripRootObject(stringifyJSONPath(error.path)) + ' ' + error.message;
+            })
+                .join(', '),
+        severity: ValidationSeverity.warning
+    };
+}
+function findRowIndex(error) {
+    return parseInt(error.path[0], 10);
+}
+function findColumnIndex(error, columns) {
+    const position = toTableCellPosition(error.path, columns);
+    if (position.columnIndex !== -1) {
+        return position.columnIndex;
+    }
+    return -1;
+}
+/**
+ * Clear the sorted column from the documentState when it is affected by the operations
+ */
+export function clearSortedColumnWhenAffectedByOperations(documentState, operations, columms) {
+    const mustBeCleared = operations.some((operation) => operationAffectsSortedColumn(documentState.sortedColumn, operation, columms));
+    if (mustBeCleared) {
+        return {
+            ...documentState,
+            sortedColumn: undefined
+        };
+    }
+    return documentState;
+}
+export function operationAffectsSortedColumn(sortedColumn, operation, columns) {
+    if (!sortedColumn) {
+        return false;
+    }
+    // an operation of replacing a value in a different column does not affect the currently sorted order
+    if (operation.op === 'replace') {
+        const path = parseJSONPointer(operation.path);
+        const { rowIndex, columnIndex } = toTableCellPosition(path, columns);
+        const selectedColumnIndex = columns.findIndex((column) => isEqual(column, sortedColumn.path));
+        if (rowIndex !== -1 && columnIndex !== -1 && columnIndex !== selectedColumnIndex) {
+            return false;
+        }
+    }
+    // TODO: there are more cases where we can known an operation does not affect the sorted order, improve this
+    //  For example adding a nested value in a different column, or removing a full row.
+    return true;
+}
+/**
+ * Find nested arrays inside a JSON object
+ */
+export function findNestedArrays(json, maxLevel = 2) {
+    const props = [];
+    function recurse(value, path) {
+        if (isJSONObject(value) && path.length < maxLevel) {
+            Object.keys(value).forEach((key) => {
+                recurse(value[key], path.concat(key));
+            });
+        }
+        if (isJSONArray(value)) {
+            props.push(path);
+        }
+    }
+    recurse(json, []);
+    return props;
+}
